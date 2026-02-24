@@ -8,7 +8,11 @@ import (
 )
 
 const nodeCount = 64
+const groupCount = 4
+const groupSize = nodeCount / groupCount
 const threshold = nodeCount*2/3 + 1
+const groupThreshold = groupSize*2/3 + 1
+const globalThreshold = groupCount*2/3 + 1
 
 // 客户端的监听地址
 var clientAddr = "127.0.0.1:8888"
@@ -17,6 +21,10 @@ var clientAddr = "127.0.0.1:8888"
 var nodeTable map[string]string
 
 func main() {
+	if nodeCount%groupCount != 0 {
+		log.Fatalf("nodeCount(%d) 必须能被 groupCount(%d) 整除", nodeCount, groupCount)
+	}
+
 	// 动态生成nodeTable，支持任意数量的节点
 	nodeTable = make(map[string]string)
 	basePorts := []int{8600, 8001, 8002, 8003, 8011, 8012, 8013, 8041, 8042, 8043,
