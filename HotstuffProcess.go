@@ -1688,13 +1688,20 @@ func (p *hotsutff) tryBroadcastFastQC(blockHash string) {
 		groupIDs = append(groupIDs, gid)
 	}
 	sort.Ints(groupIDs)
-	signers := make([]string, 0, len(groupIDs))
+	signerSet := make(map[string]struct{})
 	sigList := make([][]byte, 0, len(groupIDs))
 	for _, gid := range groupIDs {
 		gv := groupVotes[gid]
-		signers = append(signers, gv.LeaderID)
+		for _, sid := range gv.MemberSigners {
+			signerSet[sid] = struct{}{}
+		}
 		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
+	signers := make([]string, 0, len(signerSet))
+	for sid := range signerSet {
+		signers = append(signers, sid)
+	}
+	sort.Strings(signers)
 	p.lock.Unlock()
 
 	aggSig, ok := aggregateSignatures(sigList)
@@ -1755,13 +1762,20 @@ func (p *hotsutff) tryBroadcastPreCommit(blockHash string) {
 		groupIDs = append(groupIDs, gid)
 	}
 	sort.Ints(groupIDs)
-	signers := make([]string, 0, len(groupIDs))
+	signerSet := make(map[string]struct{})
 	sigList := make([][]byte, 0, len(groupIDs))
 	for _, gid := range groupIDs {
 		gv := groupVotes[gid]
-		signers = append(signers, gv.LeaderID)
+		for _, sid := range gv.MemberSigners {
+			signerSet[sid] = struct{}{}
+		}
 		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
+	signers := make([]string, 0, len(signerSet))
+	for sid := range signerSet {
+		signers = append(signers, sid)
+	}
+	sort.Strings(signers)
 	p.lock.Unlock()
 
 	aggSig, ok := aggregateSignatures(sigList)
@@ -1825,13 +1839,20 @@ func (p *hotsutff) tryBroadcastCommit(blockHash string) {
 		groupIDs = append(groupIDs, gid)
 	}
 	sort.Ints(groupIDs)
-	signers := make([]string, 0, len(groupIDs))
+	signerSet := make(map[string]struct{})
 	sigList := make([][]byte, 0, len(groupIDs))
 	for _, gid := range groupIDs {
 		gv := groupVotes[gid]
-		signers = append(signers, gv.LeaderID)
+		for _, sid := range gv.MemberSigners {
+			signerSet[sid] = struct{}{}
+		}
 		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
+	signers := make([]string, 0, len(signerSet))
+	for sid := range signerSet {
+		signers = append(signers, sid)
+	}
+	sort.Strings(signers)
 	p.lock.Unlock()
 
 	aggSig, ok := aggregateSignatures(sigList)
@@ -1891,13 +1912,20 @@ func (p *hotsutff) tryBroadcastCommitQC(blockHash string) {
 		groupIDs = append(groupIDs, gid)
 	}
 	sort.Ints(groupIDs)
-	signers := make([]string, 0, len(groupIDs))
+	signerSet := make(map[string]struct{})
 	sigList := make([][]byte, 0, len(groupIDs))
 	for _, gid := range groupIDs {
 		gv := groupVotes[gid]
-		signers = append(signers, gv.LeaderID)
+		for _, sid := range gv.MemberSigners {
+			signerSet[sid] = struct{}{}
+		}
 		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
+	signers := make([]string, 0, len(signerSet))
+	for sid := range signerSet {
+		signers = append(signers, sid)
+	}
+	sort.Strings(signers)
 	p.lock.Unlock()
 
 	aggSig, ok := aggregateSignatures(sigList)
