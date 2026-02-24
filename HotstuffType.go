@@ -81,6 +81,17 @@ type Vote struct {
 	Sig       []byte
 }
 
+// GroupVote 消息：组领导者对组内签名聚合后的阶段投票。
+type GroupVote struct {
+	View          int
+	BlockHash     string
+	Phase         Phase
+	GroupID       int
+	LeaderID      string
+	MemberSigners []string
+	GroupSig      []byte
+}
+
 // PhaseMsg消息：leader广播QC推进阶段
 type PhaseMsg struct {
 	View      int
@@ -108,6 +119,7 @@ const (
 	cvotePreCommit command = "votePreCom"
 	cmsgCommit     command = "msgCommit"
 	cvoteCommit    command = "voteCommit"
+	cgroupVote     command = "groupVote"
 	cmsgCommitQC   command = "msgCommitQC"
 	cmsgFastQC     command = "msgFastQC"
 	caggQCReq      command = "aggQCReq"

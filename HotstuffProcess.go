@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	bls12381 "github.com/kilic/bls12-381"
 )
 
 // 本地消息池（模拟持久化层），只有确认提交成功后才会存入此池
@@ -24,9 +26,13 @@ const (
 )
 
 type node struct {
-	nodeID string
-	addr   string
-	blsSk  *blsSecretKey
+	nodeID         string
+	addr           string
+	blsSk          *blsSecretKey
+	groupID        int
+	isGroupLeader  bool
+	groupLeaderID  string
+	groupMemberIDs []string
 }
 
 type hotsutff struct {
@@ -71,17 +77,25 @@ type hotsutff struct {
 	precommitVoteSigs map[string]map[string][]byte
 	commitVoteSigs    map[string]map[string][]byte
 
+	prepareGroupVotes   map[string]map[int]*GroupVote
+	precommitGroupVotes map[string]map[int]*GroupVote
+	commitGroupVotes    map[string]map[int]*GroupVote
+
+	prepareGroupSent   map[string]bool
+	precommitGroupSent map[string]bool
+	commitGroupSent    map[string]bool
+
 	precommitBroadcasted map[string]bool
 	commitBroadcasted    map[string]bool
-	commitQCBroadcasted   map[string]bool
-	fastQCBroadcasted     map[string]bool
-	slowPathReady         map[string]bool
+	commitQCBroadcasted  map[string]bool
+	fastQCBroadcasted    map[string]bool
+	slowPathReady        map[string]bool
 
-	fastQCReady      map[string]bool
-	commitReadyType  map[string]string
-	aggQCRequests    map[int]*AggQCRequest
-	aggQCVotes       map[int]map[string][]byte
-	aggQCs           map[int]*AggQC
+	fastQCReady     map[string]bool
+	commitReadyType map[string]string
+	aggQCRequests   map[int]*AggQCRequest
+	aggQCVotes      map[int]map[string][]byte
+	aggQCs          map[int]*AggQC
 
 	votedPrepare   map[string]bool
 	votedPrecommit map[string]bool
@@ -95,6 +109,10 @@ func NewHotStuff(nodeID, addr string) *hotsutff {
 	p.node.nodeID = nodeID
 	p.node.addr = addr
 	p.node.blsSk = loadBlsSecretKey(nodeID)
+	p.node.groupID = p.groupIDByNode(nodeID)
+	p.node.groupLeaderID = p.groupLeaderID(p.node.groupID)
+	p.node.isGroupLeader = nodeID == p.node.groupLeaderID
+	p.node.groupMemberIDs = p.groupMemberIDs(p.node.groupID)
 
 	p.view = 0
 	p.requestPool = make(map[int]Request)
@@ -109,6 +127,12 @@ func NewHotStuff(nodeID, addr string) *hotsutff {
 	p.prepareVoteSigs = make(map[string]map[string][]byte)
 	p.precommitVoteSigs = make(map[string]map[string][]byte)
 	p.commitVoteSigs = make(map[string]map[string][]byte)
+	p.prepareGroupVotes = make(map[string]map[int]*GroupVote)
+	p.precommitGroupVotes = make(map[string]map[int]*GroupVote)
+	p.commitGroupVotes = make(map[string]map[int]*GroupVote)
+	p.prepareGroupSent = make(map[string]bool)
+	p.precommitGroupSent = make(map[string]bool)
+	p.commitGroupSent = make(map[string]bool)
 
 	p.precommitBroadcasted = make(map[string]bool)
 	p.commitBroadcasted = make(map[string]bool)
@@ -153,7 +177,7 @@ func NewHotStuff(nodeID, addr string) *hotsutff {
 
 	go p.pacemakerLoop()
 
-	log.Printf("节点%s初始化完成（教学版Fast-HotStuff）", nodeID)
+	log.Printf("节点%s初始化完成（group=%d, groupLeader=%s, isGroupLeader=%v）", nodeID, p.node.groupID, p.node.groupLeaderID, p.node.isGroupLeader)
 	return p
 }
 
@@ -163,6 +187,62 @@ func (p *hotsutff) leaderID() string {
 
 func (p *hotsutff) isLeader() bool {
 	return p.node.nodeID == p.leaderID()
+}
+
+func (p *hotsutff) groupIDByNode(nodeID string) int {
+	id, err := strconv.Atoi(nodeID)
+	if err != nil || id < 0 {
+		return 0
+	}
+	return id / groupSize
+}
+
+func (p *hotsutff) groupLeaderID(groupID int) string {
+	return strconv.Itoa(groupID * groupSize)
+}
+
+func (p *hotsutff) groupMemberIDs(groupID int) []string {
+	start := groupID * groupSize
+	end := start + groupSize
+	members := make([]string, 0, groupSize-1)
+	for i := start; i < end; i++ {
+		id := strconv.Itoa(i)
+		if id == p.groupLeaderID(groupID) {
+			continue
+		}
+		members = append(members, id)
+	}
+	return members
+}
+
+func (p *hotsutff) isGroupLeader() bool {
+	return p.node.isGroupLeader
+}
+
+func (p *hotsutff) voteTargetNodeID() string {
+	if p.isGroupLeader() {
+		return p.node.nodeID
+	}
+	return p.node.groupLeaderID
+}
+
+func (p *hotsutff) broadcastToGroupMembers(cmd command, content []byte) {
+	for _, id := range p.node.groupMemberIDs {
+		msg := jointMessage(cmd, content)
+		go wsDial(msg, nodeTable[id])
+	}
+}
+
+func (p *hotsutff) broadcastFromProposer(cmd command, content []byte) {
+	for gid := 0; gid < groupCount; gid++ {
+		leaderID := p.groupLeaderID(gid)
+		if leaderID == p.node.nodeID {
+			p.broadcastToGroupMembers(cmd, content)
+			continue
+		}
+		msg := jointMessage(cmd, content)
+		go wsDial(msg, nodeTable[leaderID])
+	}
 }
 
 func (p *hotsutff) currentView() int {
@@ -521,7 +601,7 @@ func (p *hotsutff) proposeBatchForView(batchIDs []int, view int, reason string) 
 	}
 
 	log.Printf("[节点%s] 广播proposal(view=%d, reason=%s)，区块哈希: %s", p.node.nodeID, view, reason, block.Hash[:16]+"...")
-	p.broadcast(cproposal, b)
+	p.broadcastFromProposer(cproposal, b)
 	p.touchProgress()
 	p.armSlowPath(block.Hash)
 
@@ -567,6 +647,9 @@ func (p *hotsutff) handleRequest(data []byte, now time.Time) {
 		p.handleClientRequest(content)
 	case cproposal:
 		log.Printf("[节点%s] 收到proposal消息", p.node.nodeID)
+		if p.isGroupLeader() && !p.isLeader() {
+			p.broadcastToGroupMembers(cproposal, content)
+		}
 		p.handleproposal(content)
 	case cnewView:
 		log.Printf("[节点%s] 收到newView消息", p.node.nodeID)
@@ -576,21 +659,36 @@ func (p *hotsutff) handleRequest(data []byte, now time.Time) {
 		p.handleprepare(content)
 	case cmsgPreCommit:
 		log.Printf("[节点%s] 收到msgPreCommit消息", p.node.nodeID)
+		if p.isGroupLeader() && !p.isLeader() {
+			p.broadcastToGroupMembers(cmsgPreCommit, content)
+		}
 		p.handledepreCommit(content)
 	case cvotePreCommit:
 		log.Printf("[节点%s] 收到votePreCommit投票", p.node.nodeID)
 		p.handlepreCommit(content)
 	case cmsgCommit:
 		log.Printf("[节点%s] 收到msgCommit消息", p.node.nodeID)
+		if p.isGroupLeader() && !p.isLeader() {
+			p.broadcastToGroupMembers(cmsgCommit, content)
+		}
 		p.handledeCommit(content)
 	case cvoteCommit:
 		log.Printf("[节点%s] 收到voteCommit投票", p.node.nodeID)
 		p.handleCommit(content)
+	case cgroupVote:
+		log.Printf("[节点%s] 收到groupVote投票", p.node.nodeID)
+		p.handleGroupVote(content)
 	case cmsgCommitQC:
 		log.Printf("[节点%s] 收到msgCommitQC消息", p.node.nodeID)
+		if p.isGroupLeader() && !p.isLeader() {
+			p.broadcastToGroupMembers(cmsgCommitQC, content)
+		}
 		p.handleCommitQC(content, now)
 	case cmsgFastQC:
 		log.Printf("[节点%s] 收到msgFastQC消息", p.node.nodeID)
+		if p.isGroupLeader() && !p.isLeader() {
+			p.broadcastToGroupMembers(cmsgFastQC, content)
+		}
 		p.handleFastQC(content, now)
 	case caggQCReq:
 		log.Printf("[节点%s] 收到aggQCReq消息", p.node.nodeID)
@@ -667,7 +765,7 @@ func (p *hotsutff) handleAggQCRequest(content []byte) {
 		log.Panic(err)
 	}
 	message := jointMessage(caggQCVote, b)
-	go wsDial(message, nodeTable[p.leaderID()])
+	go wsDial(message, nodeTable[p.voteTargetNodeID()])
 }
 
 // handleAggQCVote 在主节点收集 AggQC 签名。
@@ -858,26 +956,25 @@ func (p *hotsutff) handleproposal(content []byte) {
 	}
 	message := jointMessage(cvotePrepare, b)
 	log.Printf("[节点%s] 发送Prepare Vote给主节点，区块哈希: %s", p.node.nodeID, block.Hash[:16]+"...")
-	go wsDial(message, nodeTable[p.leaderID()])
+	go wsDial(message, nodeTable[p.voteTargetNodeID()])
 }
 
-// handleprepare 在主节点收集 prepare 投票。
+// handleprepare 在组领导者收集组内 prepare 投票并上送组签名。
 func (p *hotsutff) handleprepare(content []byte) {
-	if !p.isLeader() {
+	if !p.isGroupLeader() {
 		return
 	}
 	vote := new(Vote)
 	if err := json.Unmarshal(content, vote); err != nil {
 		log.Panic(err)
 	}
-	if vote.Phase != phasePrepare {
-		return
-	}
-	if vote.View > maxView {
+	if vote.Phase != phasePrepare || vote.View > maxView {
 		return
 	}
 	if !p.verifyVoteSig(vote.NodeID, vote.Phase, vote.View, vote.BlockHash, vote.Sig) {
-		log.Printf("[节点%s] Prepare投票签名验证失败", p.node.nodeID)
+		return
+	}
+	if p.groupIDByNode(vote.NodeID) != p.node.groupID {
 		return
 	}
 
@@ -889,9 +986,8 @@ func (p *hotsutff) handleprepare(content []byte) {
 	}
 
 	p.addVote(p.prepareVotes, p.prepareVoteSigs, vote.BlockHash, vote.NodeID, vote.Sig)
+	p.trySendGroupVote(vote.BlockHash, phasePrepare)
 	p.touchProgress()
-	p.tryBroadcastFastQC(vote.BlockHash)
-	p.tryBroadcastPreCommit(vote.BlockHash)
 }
 
 // handledepreCommit 处理主节点的 precommit QC。
@@ -951,26 +1047,25 @@ func (p *hotsutff) handledepreCommit(content []byte) {
 	}
 	message := jointMessage(cvotePreCommit, b)
 	log.Printf("[节点%s] 发送PreCommit Vote给主节点，区块哈希: %s", p.node.nodeID, msg.BlockHash[:16]+"...")
-	go wsDial(message, nodeTable[p.leaderID()])
+	go wsDial(message, nodeTable[p.voteTargetNodeID()])
 }
 
-// handlepreCommit 在主节点收集 precommit 投票。
+// handlepreCommit 在组领导者收集组内 precommit 投票并上送组签名。
 func (p *hotsutff) handlepreCommit(content []byte) {
-	if !p.isLeader() {
+	if !p.isGroupLeader() {
 		return
 	}
 	vote := new(Vote)
 	if err := json.Unmarshal(content, vote); err != nil {
 		log.Panic(err)
 	}
-	if vote.Phase != phasePreCommit {
-		return
-	}
-	if vote.View > maxView {
+	if vote.Phase != phasePreCommit || vote.View > maxView {
 		return
 	}
 	if !p.verifyVoteSig(vote.NodeID, vote.Phase, vote.View, vote.BlockHash, vote.Sig) {
-		log.Printf("[节点%s] PreCommit投票签名验证失败", p.node.nodeID)
+		return
+	}
+	if p.groupIDByNode(vote.NodeID) != p.node.groupID {
 		return
 	}
 
@@ -982,8 +1077,8 @@ func (p *hotsutff) handlepreCommit(content []byte) {
 	}
 
 	p.addVote(p.precommitVotes, p.precommitVoteSigs, vote.BlockHash, vote.NodeID, vote.Sig)
+	p.trySendGroupVote(vote.BlockHash, phasePreCommit)
 	p.touchProgress()
-	p.tryBroadcastCommit(vote.BlockHash)
 }
 
 // handledeCommit 处理主节点的 precommit QC。
@@ -1043,26 +1138,25 @@ func (p *hotsutff) handledeCommit(content []byte) {
 	}
 	message := jointMessage(cvoteCommit, b)
 	log.Printf("[节点%s] 发送Commit Vote给主节点，区块哈希: %s", p.node.nodeID, msg.BlockHash[:16]+"...")
-	go wsDial(message, nodeTable[p.leaderID()])
+	go wsDial(message, nodeTable[p.voteTargetNodeID()])
 }
 
-// handleCommit 在主节点收集 commit 投票。
+// handleCommit 在组领导者收集组内 commit 投票并上送组签名。
 func (p *hotsutff) handleCommit(content []byte) {
-	if !p.isLeader() {
+	if !p.isGroupLeader() {
 		return
 	}
 	vote := new(Vote)
 	if err := json.Unmarshal(content, vote); err != nil {
 		log.Panic(err)
 	}
-	if vote.Phase != phaseCommit {
-		return
-	}
-	if vote.View > maxView {
+	if vote.Phase != phaseCommit || vote.View > maxView {
 		return
 	}
 	if !p.verifyVoteSig(vote.NodeID, vote.Phase, vote.View, vote.BlockHash, vote.Sig) {
-		log.Printf("[节点%s] Commit投票签名验证失败", p.node.nodeID)
+		return
+	}
+	if p.groupIDByNode(vote.NodeID) != p.node.groupID {
 		return
 	}
 
@@ -1074,8 +1168,143 @@ func (p *hotsutff) handleCommit(content []byte) {
 	}
 
 	p.addVote(p.commitVotes, p.commitVoteSigs, vote.BlockHash, vote.NodeID, vote.Sig)
+	p.trySendGroupVote(vote.BlockHash, phaseCommit)
 	p.touchProgress()
-	p.tryBroadcastCommitQC(vote.BlockHash)
+}
+
+func (p *hotsutff) trySendGroupVote(blockHash string, phase Phase) {
+	p.lock.Lock()
+	block, ok := p.blocks[blockHash]
+	if !ok {
+		p.lock.Unlock()
+		return
+	}
+
+	var (
+		votes map[string]map[string]bool
+		sigs  map[string]map[string][]byte
+		sent  map[string]bool
+	)
+	switch phase {
+	case phasePrepare:
+		votes, sigs, sent = p.prepareVotes, p.prepareVoteSigs, p.prepareGroupSent
+	case phasePreCommit:
+		votes, sigs, sent = p.precommitVotes, p.precommitVoteSigs, p.precommitGroupSent
+	case phaseCommit:
+		votes, sigs, sent = p.commitVotes, p.commitVoteSigs, p.commitGroupSent
+	default:
+		p.lock.Unlock()
+		return
+	}
+	if sent[blockHash] || len(votes[blockHash]) < groupThreshold {
+		p.lock.Unlock()
+		return
+	}
+	signers := p.getSigners(votes, blockHash)
+	sort.Strings(signers)
+	sigList, ok := snapshotVoteSigs(sigs, blockHash, signers)
+	if !ok {
+		p.lock.Unlock()
+		return
+	}
+	sent[blockHash] = true
+	p.lock.Unlock()
+
+	aggSig, ok := aggregateSignatures(sigList)
+	if !ok {
+		return
+	}
+	gv := GroupVote{View: block.View, BlockHash: blockHash, Phase: phase, GroupID: p.node.groupID, LeaderID: p.node.nodeID, MemberSigners: signers, GroupSig: aggSig}
+	b, err := json.Marshal(gv)
+	if err != nil {
+		log.Panic(err)
+	}
+	if p.isLeader() {
+		p.handleGroupVote(b)
+		return
+	}
+	go wsDial(jointMessage(cgroupVote, b), nodeTable[p.leaderID()])
+}
+
+func (p *hotsutff) verifyGroupVoteSig(v *GroupVote) bool {
+	if v == nil || len(v.MemberSigners) < groupThreshold || len(v.GroupSig) == 0 {
+		return false
+	}
+	if p.groupLeaderID(v.GroupID) != v.LeaderID {
+		return false
+	}
+	for _, id := range v.MemberSigners {
+		if p.groupIDByNode(id) != v.GroupID {
+			return false
+		}
+	}
+	aggPub, ok := p.aggregatePublicKeys(v.MemberSigners)
+	if !ok {
+		return false
+	}
+	sig, err := parseSignature(v.GroupSig)
+	if err != nil {
+		return false
+	}
+	msg := voteSignMessage(v.Phase, v.View, v.BlockHash)
+	hash, err := hashToG2(msg)
+	if err != nil {
+		return false
+	}
+	engine := bls12381.NewEngine()
+	engine.AddPair(aggPub.pk, hash)
+	engine.AddPairInv(engine.G1.One(), sig)
+	return engine.Check()
+}
+
+func (p *hotsutff) handleGroupVote(content []byte) {
+	if !p.isLeader() {
+		return
+	}
+	vote := new(GroupVote)
+	if err := json.Unmarshal(content, vote); err != nil {
+		log.Panic(err)
+	}
+	if vote.View > maxView || !p.verifyGroupVoteSig(vote) {
+		return
+	}
+
+	p.lock.Lock()
+	block, ok := p.blocks[vote.BlockHash]
+	if !ok || block.View != vote.View {
+		p.lock.Unlock()
+		return
+	}
+	var target map[string]map[int]*GroupVote
+	switch vote.Phase {
+	case phasePrepare:
+		target = p.prepareGroupVotes
+	case phasePreCommit:
+		target = p.precommitGroupVotes
+	case phaseCommit:
+		target = p.commitGroupVotes
+	default:
+		p.lock.Unlock()
+		return
+	}
+	if _, ok := target[vote.BlockHash]; !ok {
+		target[vote.BlockHash] = make(map[int]*GroupVote)
+	}
+	cloned := *vote
+	cloned.MemberSigners = append([]string(nil), vote.MemberSigners...)
+	cloned.GroupSig = append([]byte(nil), vote.GroupSig...)
+	target[vote.BlockHash][vote.GroupID] = &cloned
+	p.lock.Unlock()
+
+	switch vote.Phase {
+	case phasePrepare:
+		p.tryBroadcastFastQC(vote.BlockHash)
+		p.tryBroadcastPreCommit(vote.BlockHash)
+	case phasePreCommit:
+		p.tryBroadcastCommit(vote.BlockHash)
+	case phaseCommit:
+		p.tryBroadcastCommitQC(vote.BlockHash)
+	}
 }
 
 // handleCommitQC 处理主节点的 commit QC。
@@ -1339,7 +1568,7 @@ func (p *hotsutff) isQCValid(qc *QC, phase Phase, blockHash string) bool {
 	if qc.BlockHash != blockHash {
 		return false
 	}
-	if len(qc.Signers) < threshold {
+	if len(qc.Signers) < globalThreshold {
 		return false
 	}
 	if len(qc.AggSig) == 0 {
@@ -1390,7 +1619,7 @@ func (p *hotsutff) isFastQCValid(qc *QC, blockHash string) bool {
 	if qc.BlockHash != blockHash {
 		return false
 	}
-	if len(qc.Signers) < threshold {
+	if len(qc.Signers) < globalThreshold {
 		return false
 	}
 	if len(qc.AggSig) == 0 {
@@ -1444,7 +1673,7 @@ func (p *hotsutff) tryBroadcastFastQC(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	if len(p.prepareVotes[blockHash]) < threshold {
+	if len(p.prepareGroupVotes[blockHash]) < globalThreshold {
 		p.lock.Unlock()
 		return
 	}
@@ -1453,11 +1682,18 @@ func (p *hotsutff) tryBroadcastFastQC(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	signers := p.getSigners(p.prepareVotes, blockHash)
-	sigList, ok := snapshotVoteSigs(p.prepareVoteSigs, blockHash, signers)
-	if !ok {
-		p.lock.Unlock()
-		return
+	groupVotes := p.prepareGroupVotes[blockHash]
+	groupIDs := make([]int, 0, len(groupVotes))
+	for gid := range groupVotes {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Ints(groupIDs)
+	signers := make([]string, 0, len(groupIDs))
+	sigList := make([][]byte, 0, len(groupIDs))
+	for _, gid := range groupIDs {
+		gv := groupVotes[gid]
+		signers = append(signers, gv.LeaderID)
+		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
 	p.lock.Unlock()
 
@@ -1485,7 +1721,7 @@ func (p *hotsutff) tryBroadcastFastQC(blockHash string) {
 	p.lock.Unlock()
 
 	log.Printf("[节点%s] 广播msgFastQC，区块哈希: %s", p.node.nodeID, blockHash[:16]+"...")
-	p.broadcast(cmsgFastQC, b)
+	p.broadcastFromProposer(cmsgFastQC, b)
 	p.touchProgress()
 	p.handleFastQC(b, time.Now())
 }
@@ -1504,7 +1740,7 @@ func (p *hotsutff) tryBroadcastPreCommit(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	if len(p.prepareVotes[blockHash]) < threshold {
+	if len(p.prepareGroupVotes[blockHash]) < globalThreshold {
 		p.lock.Unlock()
 		return
 	}
@@ -1513,11 +1749,18 @@ func (p *hotsutff) tryBroadcastPreCommit(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	signers := p.getSigners(p.prepareVotes, blockHash)
-	sigList, ok := snapshotVoteSigs(p.prepareVoteSigs, blockHash, signers)
-	if !ok {
-		p.lock.Unlock()
-		return
+	groupVotes := p.prepareGroupVotes[blockHash]
+	groupIDs := make([]int, 0, len(groupVotes))
+	for gid := range groupVotes {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Ints(groupIDs)
+	signers := make([]string, 0, len(groupIDs))
+	sigList := make([][]byte, 0, len(groupIDs))
+	for _, gid := range groupIDs {
+		gv := groupVotes[gid]
+		signers = append(signers, gv.LeaderID)
+		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
 	p.lock.Unlock()
 
@@ -1545,7 +1788,7 @@ func (p *hotsutff) tryBroadcastPreCommit(blockHash string) {
 	p.lock.Unlock()
 
 	log.Printf("[节点%s] 广播msgPreCommit，区块哈希: %s", p.node.nodeID, blockHash[:16]+"...")
-	p.broadcast(cmsgPreCommit, b)
+	p.broadcastFromProposer(cmsgPreCommit, b)
 	p.touchProgress()
 
 	selfSig := p.signVote(phasePreCommit, block.View, blockHash)
@@ -1567,7 +1810,7 @@ func (p *hotsutff) tryBroadcastCommit(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	if len(p.precommitVotes[blockHash]) < threshold {
+	if len(p.precommitGroupVotes[blockHash]) < globalThreshold {
 		p.lock.Unlock()
 		return
 	}
@@ -1576,11 +1819,18 @@ func (p *hotsutff) tryBroadcastCommit(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	signers := p.getSigners(p.precommitVotes, blockHash)
-	sigList, ok := snapshotVoteSigs(p.precommitVoteSigs, blockHash, signers)
-	if !ok {
-		p.lock.Unlock()
-		return
+	groupVotes := p.precommitGroupVotes[blockHash]
+	groupIDs := make([]int, 0, len(groupVotes))
+	for gid := range groupVotes {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Ints(groupIDs)
+	signers := make([]string, 0, len(groupIDs))
+	sigList := make([][]byte, 0, len(groupIDs))
+	for _, gid := range groupIDs {
+		gv := groupVotes[gid]
+		signers = append(signers, gv.LeaderID)
+		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
 	p.lock.Unlock()
 
@@ -1608,7 +1858,7 @@ func (p *hotsutff) tryBroadcastCommit(blockHash string) {
 	p.lock.Unlock()
 
 	log.Printf("[节点%s] 广播msgCommit，区块哈希: %s", p.node.nodeID, blockHash[:16]+"...")
-	p.broadcast(cmsgCommit, b)
+	p.broadcastFromProposer(cmsgCommit, b)
 	p.touchProgress()
 
 	selfSig := p.signVote(phaseCommit, block.View, blockHash)
@@ -1626,7 +1876,7 @@ func (p *hotsutff) tryBroadcastCommitQC(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	if len(p.commitVotes[blockHash]) < threshold {
+	if len(p.commitGroupVotes[blockHash]) < globalThreshold {
 		p.lock.Unlock()
 		return
 	}
@@ -1635,11 +1885,18 @@ func (p *hotsutff) tryBroadcastCommitQC(blockHash string) {
 		p.lock.Unlock()
 		return
 	}
-	signers := p.getSigners(p.commitVotes, blockHash)
-	sigList, ok := snapshotVoteSigs(p.commitVoteSigs, blockHash, signers)
-	if !ok {
-		p.lock.Unlock()
-		return
+	groupVotes := p.commitGroupVotes[blockHash]
+	groupIDs := make([]int, 0, len(groupVotes))
+	for gid := range groupVotes {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Ints(groupIDs)
+	signers := make([]string, 0, len(groupIDs))
+	sigList := make([][]byte, 0, len(groupIDs))
+	for _, gid := range groupIDs {
+		gv := groupVotes[gid]
+		signers = append(signers, gv.LeaderID)
+		sigList = append(sigList, append([]byte(nil), gv.GroupSig...))
 	}
 	p.lock.Unlock()
 
@@ -1667,8 +1924,7 @@ func (p *hotsutff) tryBroadcastCommitQC(blockHash string) {
 	p.lock.Unlock()
 
 	log.Printf("[节点%s] 广播msgCommitQC，区块哈希: %s", p.node.nodeID, blockHash[:16]+"...")
-	p.broadcast(cmsgCommitQC, b)
+	p.broadcastFromProposer(cmsgCommitQC, b)
 	p.touchProgress()
 	p.handleCommitQC(b, time.Now())
 }
-
